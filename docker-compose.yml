@@ -27,6 +27,11 @@ services:
       MAX_SESSIONS: "2"
       SESSION_TTL_SECONDS: "60"
       PAGE_SIZE_CAP: "100"
+      # 快照会话专用池：上限与会话名额相同（2）。两条会话占满会话池后，
+      # 源端写入仍走独立的写入池立即提交（本服务的连接分配设计）。
+      POOL_MAX_SIZE: "2"
+      WRITE_POOL_MAX_SIZE: "2"
+      CONN_TIMEOUT_SECONDS: "10"
       # 开启后可用 X-Debug-Sleep-Seconds 头制造慢取页，供演示使用
       ENABLE_DEBUG_HOOKS: "true"
     ports:

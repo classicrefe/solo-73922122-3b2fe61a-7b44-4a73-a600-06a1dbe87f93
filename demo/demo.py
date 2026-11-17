@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""慢取页与关键语义端到端演示（仅依赖标准库）。
+"""关键语义端到端演示（仅依赖标准库）。
 
 前置：docker compose up -d 后运行  python3 demo/demo.py
 
@@ -9,8 +9,11 @@
    重复取第 1 页与首次结果逐行一致（同一快照）。
 2. 快照隔离：会话开启后通过源端接口补录/修改/删除数据并提交，
    会话内取页结果不变。
-3. 名额控制：最多 2 个会话，第 3 个开启请求被 429 拒绝；
-   关闭一个后名额归还，可再开；另一个会话不受影响。
+3. 满额写入（连接分配修复的核心）：两条会话占满名额
+   （MAX_SESSIONS=POOL_MAX_SIZE=2），第 3 个会话被 429 拒绝；
+   此时源端增/改/删走独立写入池**立即提交**（计时验证，不等待会话
+   关闭）；旧会话后续取页仍读开启时的两表快照；关闭一条会话后，
+   新会话读到全部已提交改动。
 4. 慢取页 + 及时关闭：用 X-Debug-Sleep-Seconds 头让取页变慢，
    在它响应前发起关闭，关闭返回后再取页 -> 409 且无明细。
 5. 到期失效（可选，较慢）：设置 DEMO_TTL_WAIT=1 时，
@@ -61,6 +64,21 @@ def title(n: int, text: str) -> None:
     print(f"\n=== 场景 {n}：{text} ===")
 
 
+def all_claim_ids(sid: str) -> set[int]:
+    """翻完全部页，收集该会话快照内的全部 claim_id。"""
+    ids: set[int] = set()
+    page_no = 1
+    while True:
+        st, body = call(
+            "GET", f"/sessions/{sid}/claims?page={page_no}&page_size=100"
+        )
+        assert st == 200, f"取页失败: {st} {body}"
+        ids.update(r["claim_id"] for r in body["rows"])
+        if not body["has_more"]:
+            return ids
+        page_no += 1
+
+
 def main() -> int:
     print(f"目标服务: {BASE}")
     status, meta = call("GET", "/meta")
@@ -103,9 +121,9 @@ def main() -> int:
 
     # ------------------------------------------------------------------
     title(2, "快照隔离：源端增改删照常提交，会话内数据不变")
-    _, pol = call("POST", "/admin/policies", {"region": "华北"})
-    _, new_claim = call("POST", "/admin/claims", {"policy_id": pol["id"], "amount": 55500})
-    check(new_claim["amount"] == 55500, f"源端补录理赔 id={new_claim['id']} 已提交")
+    _, pol_a = call("POST", "/admin/policies", {"region": "华北"})
+    _, claim_a = call("POST", "/admin/claims", {"policy_id": pol_a["id"], "amount": 55500})
+    check(claim_a["amount"] == 55500, f"源端补录理赔 id={claim_a['id']} 已提交")
     # 记录原始金额，用与之不同的新值修改，保证演示可重复运行
     original_amount = p1["rows"][0]["amount"]
     changed_amount = (original_amount + 12345) % 500000
@@ -116,28 +134,56 @@ def main() -> int:
     st, p1c = call("GET", f"/sessions/{sid1}/claims?page=1&page_size=100")
     check([r["claim_id"] for r in p1c["rows"]] == ids1, "快照会话第 1 页仍为 100 行且 id 序列不变")
     check(p1c["rows"][0]["amount"] == original_amount, "被修改的金额在快照中保持原值")
-    check(new_claim["id"] not in [r["claim_id"] for r in p1c["rows"]], "新补录理赔在快照中不可见")
+    check(claim_a["id"] not in [r["claim_id"] for r in p1c["rows"]], "新补录理赔在快照中不可见")
 
     # ------------------------------------------------------------------
-    title(3, "名额控制：最多 2 个会话，满额 429，关闭后归还且互不影响")
+    title(3, "满额写入：两条会话占满名额时源端写入立即提交，新旧会话各读其快照")
     _, s2 = call("POST", "/sessions", {"region": "华东"})
     sid2 = s2["session_id"]
     st, err = call("POST", "/sessions", {"region": "华南"})
-    check(st == 429 and err["code"] == "capacity_reached", f"第 3 个会话被拒绝：HTTP {st} {err['detail']}")
+    check(st == 429 and err["code"] == "capacity_reached",
+          f"名额已满（2 条会话占满快照池），第 3 个会话被拒绝：HTTP {st}")
 
-    st, info1 = call("GET", f"/sessions/{sid1}")
-    check(st == 200 and info1["status"] == "open", "已满额时既有会话 1 仍可查询且保持 open")
+    # 核心验证：会话池已被两条会话占满，写入走独立写入池立即提交，
+    # 不等待会话关闭（TTL 60s，这里断言远小于 TTL）。
+    t0 = time.monotonic()
+    st, pol_b = call("POST", "/admin/policies", {"region": "华北"})
+    assert st == 201, f"补录保单失败: {st} {pol_b}"
+    st, claim_b = call("POST", "/admin/claims", {"policy_id": pol_b["id"], "amount": 88800})
+    assert st == 201, f"补录理赔失败: {st} {claim_b}"
+    st, patched = call("PATCH", f"/admin/claims/{ids1[2]}?amount={changed_amount}")
+    assert st == 200, f"修改理赔失败: {st} {patched}"
+    st, _ = call("DELETE", f"/admin/claims/{ids1[3]}")
+    assert st == 204, f"删除理赔失败: {st}"
+    elapsed = time.monotonic() - t0
+    check(elapsed < 5,
+          f"满额时源端增/改/删 {elapsed:.2f}s 内全部提交（不等待会话关闭）")
 
-    st, closed = call("POST", f"/sessions/{sid2}/close")
-    check(st == 200 and closed["status"] == "closed", f"关闭会话 2 -> {closed['status']}")
+    st, p1d = call("GET", f"/sessions/{sid1}/claims?page=1&page_size=100")
+    check([r["claim_id"] for r in p1d["rows"]] == ids1,
+          "旧会话（会话 1）后续取页仍读开启时的两表快照：id 序列不变")
+    check(claim_b["id"] not in [r["claim_id"] for r in p1d["rows"]],
+          "满额期间补录的理赔在旧会话快照中不可见")
 
-    st, s3 = call("POST", "/sessions", {"region": "华南"})
+    st, p2b = call("GET", f"/sessions/{sid2}/claims?page=1&page_size=5")
+    check(st == 200 and len(p2b["rows"]) == 5, "会话 2 在满额写入后仍正常取页")
+
+    st, closed1 = call("POST", f"/sessions/{sid1}/close")
+    check(st == 200 and closed1["status"] == "closed", "关闭会话 1，释放一个名额")
+
+    st, s3 = call("POST", "/sessions", {"region": "华北"})
     sid3 = s3["session_id"]
-    check(st == 201, "名额归还后新会话开启成功")
+    check(st == 201 and s3["status"] == "open", "关闭一条后新会话开启成功")
+    ids3 = all_claim_ids(sid3)
+    check(claim_a["id"] in ids3 and claim_b["id"] in ids3,
+          "新会话读到场景 2/3 已提交的两条补录理赔")
+    check(ids1[1] not in ids3 and ids1[3] not in ids3,
+          "新会话中两条已删除理赔不可见")
+    check(len(ids3) == 120, "新会话华北理赔总数回到 120（120 - 2 删 + 2 增）")
 
-    st, p1d = call("GET", f"/sessions/{sid1}/claims?page=1&page_size=5")
-    check(st == 200 and len(p1d["rows"]) == 5, "会话 1 不受会话 2 关闭影响，仍可正常取页")
-    call("POST", f"/sessions/{sid3}/close")
+    st, p2c = call("GET", f"/sessions/{sid2}/claims?page=2&page_size=5")
+    check(st == 200 and len(p2c["rows"]) == 5, "会话 2 不受会话 1 关闭影响，继续取页")
+    call("POST", f"/sessions/{sid2}/close")
 
     # ------------------------------------------------------------------
     title(4, "慢取页演示：关闭及时受理，受理后未开始响应的取页失败且无明细")
@@ -195,8 +241,10 @@ def main() -> int:
         check(st == 201 and s7["status"] == "open", "到期释放名额后可开启新会话")
         call("POST", f"/sessions/{s7['session_id']}/close")
 
-    # 收尾
-    call("POST", f"/sessions/{sid1}/close")
+    # 收尾：关闭所有仍存活的会话，保证演示可重复运行
+    for s in call("GET", "/sessions")[1]:
+        if s["status"] in ("open", "closing"):
+            call("POST", f"/sessions/{s['session_id']}/close")
 
     print("\n" + "=" * 60)
     failed = [m for ok, m in results if not ok]

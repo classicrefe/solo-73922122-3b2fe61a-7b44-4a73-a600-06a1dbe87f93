@@ -4,7 +4,9 @@ from __future__ import annotations
 import asyncio
 import time
 from contextlib import asynccontextmanager
+from typing import Callable, TypeVar
 
+import psycopg
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 
@@ -38,7 +40,8 @@ app = FastAPI(
     description=(
         "按地区开启快照会话，按理赔 id 升序分页提取。\n\n"
         "- 会话内两表（policies/claims）固定为开启时刻的同一快照\n"
-        "- 源端增改删照常提交，不影响会话内读取\n"
+        "- 源端增改删走独立写入连接池，会话占满时也照常立即提交，"
+        "不影响会话内读取\n"
         f"- 最多 {settings.max_sessions} 个并发会话，会话 {settings.session_ttl_seconds} 秒到期\n"
         "- 关闭受理后未开始响应的取页一律失败，不返回明细"
     ),
@@ -86,6 +89,9 @@ def meta():
         "session_ttl_seconds": settings.session_ttl_seconds,
         "page_size_cap": settings.page_size_cap,
         "debug_hooks_enabled": settings.enable_debug_hooks,
+        "session_pool_max_size": settings.pool_max_size,
+        "write_pool_max_size": settings.write_pool_max_size,
+        "conn_timeout_seconds": settings.conn_timeout_seconds,
     }
 
 
@@ -194,8 +200,33 @@ async def fetch_claims(
 
 # ----------------------------------------------------------------------
 # 源端补录接口（对应 db/init/03_sql_examples.sql 的 SQL 示例）
-# 池连接为自动提交模式：单条写语句执行即提交，不触碰任何会话快照。
+# 写入走独立的写入连接池（与会话快照池隔离）：自动提交、单条语句
+# 执行即提交；即使两条会话占满会话池，写入也立即借到连接并提交，
+# 不等待会话关闭，也不触碰任何会话快照。
 # ----------------------------------------------------------------------
+T = TypeVar("T")
+
+
+async def _run_write(work: Callable[[], T]) -> T:
+    """在线程池执行源端写入，并把数据库错误映射为干净的 HTTP 响应。
+
+    约束冲突（如理赔指向不存在的保单）-> 400，语句未提交；
+    其它数据库错误 -> 503。无论成败，连接都已在
+    ``SessionManager.write_conn`` 的 finally 中归还，不会遗留。
+    """
+    try:
+        return await asyncio.to_thread(work)
+    except psycopg.IntegrityError as exc:
+        detail = exc.diag.message_primary if exc.diag else str(exc)
+        raise HTTPException(
+            status_code=400, detail=f"写入违反约束，未提交：{detail}"
+        ) from exc
+    except psycopg.Error as exc:
+        raise HTTPException(
+            status_code=503, detail=f"数据库写入失败，未提交：{exc}"
+        ) from exc
+
+
 @app.post(
     "/admin/policies",
     response_model=PolicyOut,
@@ -205,16 +236,13 @@ async def fetch_claims(
 )
 async def create_policy(body: PolicyIn):
     def _insert():
-        conn = manager.pool().getconn()
-        try:
+        with manager.write_conn() as conn:
             return conn.execute(
                 "INSERT INTO policies (region) VALUES (%s) RETURNING id, region",
                 (body.region,),
             ).fetchone()
-        finally:
-            manager.pool().putconn(conn)
 
-    row = await asyncio.to_thread(_insert)
+    row = await _run_write(_insert)
     return PolicyOut(**row)
 
 
@@ -224,20 +252,18 @@ async def create_policy(body: PolicyIn):
     status_code=201,
     tags=["admin"],
     summary="补录理赔（源端写操作，照常提交）",
+    responses={400: {"model": Message, "description": "违反约束（如保单不存在）"}},
 )
 async def create_claim(body: ClaimIn):
     def _insert():
-        conn = manager.pool().getconn()
-        try:
+        with manager.write_conn() as conn:
             return conn.execute(
                 "INSERT INTO claims (policy_id, amount) VALUES (%s, %s) "
                 "RETURNING id, policy_id, amount",
                 (body.policy_id, body.amount),
             ).fetchone()
-        finally:
-            manager.pool().putconn(conn)
 
-    row = await asyncio.to_thread(_insert)
+    row = await _run_write(_insert)
     return ClaimOut(**row)
 
 
@@ -249,17 +275,14 @@ async def create_claim(body: ClaimIn):
 )
 async def update_claim(claim_id: int, amount: int = Query(..., ge=0)):
     def _update():
-        conn = manager.pool().getconn()
-        try:
+        with manager.write_conn() as conn:
             return conn.execute(
                 "UPDATE claims SET amount = %s WHERE id = %s "
                 "RETURNING id, policy_id, amount",
                 (amount, claim_id),
             ).fetchone()
-        finally:
-            manager.pool().putconn(conn)
 
-    row = await asyncio.to_thread(_update)
+    row = await _run_write(_update)
     if row is None:
         raise HTTPException(status_code=404, detail=f"理赔 {claim_id} 不存在")
     return ClaimOut(**row)
@@ -273,15 +296,12 @@ async def update_claim(claim_id: int, amount: int = Query(..., ge=0)):
 )
 async def delete_claim(claim_id: int):
     def _delete():
-        conn = manager.pool().getconn()
-        try:
+        with manager.write_conn() as conn:
             return conn.execute(
                 "DELETE FROM claims WHERE id = %s RETURNING id", (claim_id,)
             ).fetchone()
-        finally:
-            manager.pool().putconn(conn)
 
-    row = await asyncio.to_thread(_delete)
+    row = await _run_write(_delete)
     if row is None:
         raise HTTPException(status_code=404, detail=f"理赔 {claim_id} 不存在")
     # 204 必须无响应体

@@ -2,8 +2,10 @@
 
 运行方式（本地已起好 PostgreSQL 15，见 README）：
     DATABASE_URL=postgresql://actuary:actuary@127.0.0.1:55432/claims \
-    SESSION_TTL_SECONDS=2 ENABLE_DEBUG_HOOKS=true \
     python -m unittest tests.test_api -v
+
+测试固定以 MAX_SESSIONS=2、POOL_MAX_SIZE=2 运行：两条会话即可占满
+快照会话池，用于验证源端写入走独立写入池、不再等待会话关闭。
 """
 from __future__ import annotations
 
@@ -20,9 +22,13 @@ import uvicorn
 os.environ.setdefault(
     "DATABASE_URL", "postgresql://actuary:actuary@127.0.0.1:55432/claims"
 )
-os.environ.setdefault("SESSION_TTL_SECONDS", "2")
+os.environ.setdefault("SESSION_TTL_SECONDS", "5")
 os.environ.setdefault("ENABLE_DEBUG_HOOKS", "true")
 os.environ.setdefault("SWEEPER_INTERVAL_SECONDS", "0.1")
+# 复现"会话占满快照池"的约束配置：会话池上限 = 会话名额 = 2；
+# 写入池单独限为 1，便于精确制造"写入排队等连接"的交错。
+os.environ.setdefault("POOL_MAX_SIZE", "2")
+os.environ.setdefault("WRITE_POOL_MAX_SIZE", "1")
 
 from app.config import settings  # noqa: E402
 from app.main import app, manager  # noqa: E402
@@ -106,6 +112,19 @@ class ApiTestBase(unittest.TestCase):
             params={"page": page, "page_size": page_size},
             headers=headers or {},
         )
+
+    def all_claim_ids(self, sid) -> set[int]:
+        """翻完全部页，收集该会话快照内的全部 claim_id。"""
+        ids: set[int] = set()
+        page_no = 1
+        while True:
+            r = self.page(sid, page=page_no)
+            self.assertEqual(r.status_code, 200, r.text)
+            body = r.json()
+            ids.update(row["claim_id"] for row in body["rows"])
+            if not body["has_more"]:
+                return ids
+            page_no += 1
 
 
 class TestPagination(ApiTestBase):
@@ -211,6 +230,161 @@ class TestSnapshotIsolation(ApiTestBase):
         self.assertTrue(all(r["region"] == "华东" for r in b["rows"]))
 
 
+class TestWritePathIsolation(ApiTestBase):
+    """连接分配修复的核心验证：MAX_SESSIONS=POOL_MAX_SIZE=2 时，
+    两条会话占满快照会话池，源端写入仍走独立写入池立即提交。"""
+
+    def test_writes_commit_promptly_with_full_quota(self):
+        self._reset_seed()
+        s1 = self.open("华北")
+        s2 = self.open("华东")
+        # 名额与快照会话池均已占满：第三个会话被 429 拒绝
+        self.assertEqual(
+            self.client.post("/sessions", json={"region": "华南"}).status_code,
+            429,
+        )
+        # 源端写入不再等待会话关闭（TTL=5s，断言远小于 TTL）
+        t0 = time.monotonic()
+        pol = self.client.post("/admin/policies", json={"region": "华北"})
+        self.assertEqual(pol.status_code, 201, pol.text)
+        nc = self.client.post(
+            "/admin/claims",
+            json={"policy_id": pol.json()["id"], "amount": 4242},
+        )
+        self.assertEqual(nc.status_code, 201, nc.text)
+        elapsed = time.monotonic() - t0
+        self.assertLess(elapsed, 2.0, f"写入耗时 {elapsed:.2f}s，疑似在等会话连接")
+
+        # 两条旧会话仍读到开启时的快照：新补录理赔不可见
+        self.assertNotIn(nc.json()["id"], self.all_claim_ids(s1["session_id"]))
+        # 两条快照持续可分页
+        self.assertEqual(
+            self.page(s2["session_id"], page_size=5).status_code, 200
+        )
+
+        # 关闭一条会话后，新会话读到已提交改动
+        self.close(s1["session_id"])
+        s3 = self.open("华北")
+        self.assertIn(nc.json()["id"], self.all_claim_ids(s3["session_id"]))
+        self.close(s2["session_id"])
+        self.close(s3["session_id"])
+
+    def test_two_sessions_keep_paging_while_writes_commit(self):
+        self._reset_seed()
+        s1 = self.open("华北")
+        s2 = self.open("华北")
+        p1_s1 = self.page(s1["session_id"], page_size=50).json()
+        p1_s2 = self.page(s2["session_id"], page_size=50).json()
+        self.assertEqual(
+            [r["claim_id"] for r in p1_s1["rows"]],
+            [r["claim_id"] for r in p1_s2["rows"]],
+        )
+
+        # 源端增/改/删照常提交
+        pol = self.client.post("/admin/policies", json={"region": "华北"}).json()
+        nc = self.client.post(
+            "/admin/claims", json={"policy_id": pol["id"], "amount": 999}
+        ).json()
+        first_id = p1_s1["rows"][0]["claim_id"]
+        second_id = p1_s1["rows"][1]["claim_id"]
+        original_amount = p1_s1["rows"][0]["amount"]
+        self.assertEqual(
+            self.client.patch(
+                f"/admin/claims/{first_id}", params={"amount": 7}
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.delete(f"/admin/claims/{second_id}").status_code, 204
+        )
+
+        # 会话 1 继续取后续页：仍是开启时的两表快照
+        ids_s1 = self.all_claim_ids(s1["session_id"])
+        self.assertEqual(len(ids_s1), 120)
+        self.assertNotIn(nc["id"], ids_s1)      # 新增不可见
+        self.assertIn(second_id, ids_s1)        # 删除不可见
+        again = self.page(s1["session_id"], page_size=50).json()
+        self.assertEqual(again["rows"][0]["amount"], original_amount)  # 修改不可见
+
+        # 会话 2 重复取第 1 页，与会话 1 首次完全一致
+        p1_s2b = self.page(s2["session_id"], page_size=50).json()
+        self.assertEqual(
+            [r["claim_id"] for r in p1_s2b["rows"]],
+            [r["claim_id"] for r in p1_s1["rows"]],
+        )
+        self.close(s1["session_id"])
+        self.close(s2["session_id"])
+
+    def test_failed_write_keeps_snapshots_and_connections(self):
+        self._reset_seed()
+        s1 = self.open("华北")
+        s2 = self.open("华东")
+        before = self.all_claim_ids(s1["session_id"])
+
+        # 外键指向不存在的保单 -> 400，语句未提交
+        for _ in range(4):
+            r = self.client.post(
+                "/admin/claims", json={"policy_id": 999999, "amount": 1}
+            )
+            self.assertEqual(r.status_code, 400, r.text)
+            self.assertNotIn("rows", r.json())
+
+        # 失败不遗留连接（WRITE_POOL_MAX_SIZE=1）：正常写入仍立即成功
+        t0 = time.monotonic()
+        ok = self.client.post("/admin/claims", json={"policy_id": 1, "amount": 100})
+        self.assertEqual(ok.status_code, 201, ok.text)
+        self.assertLess(time.monotonic() - t0, 2.0)
+
+        # 快照未被失败写入损坏：两会话取页如常，看不到任何新写入
+        self.assertEqual(self.all_claim_ids(s1["session_id"]), before)
+        self.assertEqual(
+            self.page(s2["session_id"], page_size=5).status_code, 200
+        )
+
+        # 关闭一条后新会话看到已提交写入；失败写入无痕迹
+        self.close(s2["session_id"])
+        s3 = self.open("华北")
+        ids3 = self.all_claim_ids(s3["session_id"])
+        self.assertIn(ok.json()["id"], ids3)
+        self.assertEqual(len(ids3), 121)  # 只多 1 条成功写入
+        self.close(s1["session_id"])
+        self.close(s3["session_id"])
+
+    def test_status_and_close_available_while_write_waits(self):
+        s = self.open("华北")
+        sid = s["session_id"]
+        # 占满写入池（WRITE_POOL_MAX_SIZE=1），让随后的写请求排队等连接
+        held = manager.write_pool().getconn(timeout=5)
+        box: dict = {}
+
+        def writer():
+            box["r"] = self.client.post(
+                "/admin/policies", json={"region": "西南"}, timeout=20
+            )
+
+        t = threading.Thread(target=writer, name="blocked-writer", daemon=True)
+        try:
+            t.start()
+            time.sleep(0.5)  # 写请求已在等待写入连接
+            # 等待写入期间：状态查询可用
+            t0 = time.monotonic()
+            info = self.client.get(f"/sessions/{sid}")
+            self.assertEqual(info.status_code, 200, info.text)
+            self.assertEqual(info.json()["status"], "open")
+            self.assertLess(time.monotonic() - t0, 3)
+            # 等待写入期间：主动关闭可用
+            t0 = time.monotonic()
+            r = self.close(sid)
+            self.assertEqual(r.status_code, 200, r.text)
+            self.assertEqual(r.json()["status"], "closed")
+            self.assertLess(time.monotonic() - t0, 3)
+        finally:
+            # 释放写入连接，排队的写请求得以完成；连接绝不遗留
+            manager.write_pool().putconn(held)
+            t.join(timeout=20)
+        self.assertEqual(box["r"].status_code, 201, box["r"].text)
+
+
 class TestCapacity(ApiTestBase):
     def test_max_two_sessions_and_release(self):
         s1 = self.open("华东")
@@ -234,6 +408,24 @@ class TestCapacity(ApiTestBase):
         r = self.client.get("/sessions/nonexistent/claims")
         self.assertEqual(r.status_code, 404)
         self.assertEqual(self.client.get("/sessions/nonexistent").status_code, 404)
+
+    def test_concurrent_opens_never_exceed_quota(self):
+        # 8 路并发开启：名额预占在锁内完成，恰好 2 个成功、6 个 429
+        results: list[int] = []
+
+        def opener():
+            results.append(
+                self.client.post("/sessions", json={"region": "华北"}).status_code
+            )
+
+        threads = [threading.Thread(target=opener) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(
+            sorted(results), [201, 201, 429, 429, 429, 429, 429, 429]
+        )
 
 
 class TestCloseSemantics(ApiTestBase):
